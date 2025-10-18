@@ -17,6 +17,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/joho/godotenv"
+	"github.com/shopspring/decimal"
 
 	generated "eabz/pancakeswap-buybot/generated"
 )
@@ -44,6 +45,22 @@ func applySlippage(amount *big.Int, slippageBps int64) (*big.Int, error) {
 	return result.Div(result, big.NewInt(10000)), nil
 }
 
+func ToDecimal(ivalue interface{}, decimals int) decimal.Decimal {
+	value := new(big.Int)
+	switch v := ivalue.(type) {
+	case string:
+		value.SetString(v, 10)
+	case *big.Int:
+		value = v
+	}
+
+	mul := decimal.NewFromFloat(float64(10)).Pow(decimal.NewFromFloat(float64(decimals)))
+	num, _ := decimal.NewFromString(value.String())
+	result := num.Div(mul)
+
+	return result.Round(6)
+}
+
 func purchaseToken(
 	ctx context.Context,
 	client *ethclient.Client,
@@ -65,6 +82,17 @@ func purchaseToken(
 	default:
 		log.Println("pair does not involve wbnb, skipping")
 		return
+	}
+
+	symbol := token.Hex()
+	decimals := uint8(18)
+	if erc20, err := generated.NewErc20(token, client); err == nil {
+		if sym, err := erc20.Symbol(nil); err == nil && sym != "" {
+			symbol = sym
+		}
+		if dec, err := erc20.Decimals(nil); err == nil {
+			decimals = dec
+		}
 	}
 
 	path := []common.Address{wbnb, token}
@@ -123,7 +151,7 @@ func purchaseToken(
 		return
 	}
 
-	log.Printf("==> Expected out: %s | min out (5%% slippage): %s", expectedOut.String(), amountOutMin.String())
+	log.Printf("==> Expected out: %s %s | min out (5%% slippage): %s %s", ToDecimal(expectedOut, int(decimals)), symbol, ToDecimal(amountOutMin, int(decimals)), symbol)
 
 	auth, err := bind.NewKeyedTransactorWithChainID(privateKey, chainID)
 	if err != nil {
@@ -162,7 +190,7 @@ func purchaseToken(
 	log.Println("")
 	log.Println("==> Buy transaction successful")
 	log.Println("==> Tx Hash:", tx.Hash().Hex())
-	log.Println("==> Tokens received:", amountOutMin)
+	log.Printf("==> Tokens received: %s %s", ToDecimal(amountOutMin, int(decimals)), symbol)
 	log.Println("==> Gas used:", receipt.GasUsed)
 	if receipt.Status == 1 {
 		log.Println("==> Status: succeed")
