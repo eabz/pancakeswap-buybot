@@ -1,6 +1,6 @@
 # PancakeSwap Buy Bot
 
-This project listens for newly created PancakeSwap V2 pairs and, when the WBNB side of the pair is detected, attempts to buy the partner token with a fixed WBNB amount. The trade is executed through the router only if current reserves imply a price impact below the configured threshold.
+This project listens for newly created PancakeSwap V2 pairs and, when the WBNB side of the pair is detected, attempts to buy the partner token with a fixed WBNB amount. The trade is executed through the router using a constant slippage buffer to compute `amountOutMin` before submission.
 
 > **Warning**
 > This bot is created for testing purposes only. It is not optimized for mainnet or real trading, and using real funds may result in losing money.
@@ -9,8 +9,8 @@ This project listens for newly created PancakeSwap V2 pairs and, when the WBNB s
 
 - Subscribes to the factory’s `PairCreated` event via go-ethereum filter streams.
 - Loads shared ABIs from generated Go bindings (`generated/`).
-- Computes live reserves through the pair contract to derive slippage and price impact.
-- Skips trades when calculated slippage exceeds 20 %.
+- Computes live reserves through the pair contract to quote the output for the fixed trade size.
+- Applies a fixed 5 % slippage buffer when computing `amountOutMin`.
 - Executes `swapExactETHForTokens` on PancakeSwap V2 using an account private key supplied through `.env`.
 
 ## Requirements
@@ -22,7 +22,7 @@ This project listens for newly created PancakeSwap V2 pairs and, when the WBNB s
 
 ## Project Layout
 
-- `main.go` – entrypoint, log subscription, trade execution, slippage checks.
+- `main.go` – entrypoint, log subscription, reserve/quote lookups, fixed-slippage trade execution.
 - `generated/` – Go bindings produced by `abigen` (`UniswapV2Factory`, `UniswapV2Router`, `UniswapV2Pair`, `Erc20`).
 - `abis/` – canonical ABI JSON sources.
 - `.env.example` – required environment variables.
@@ -66,8 +66,8 @@ The process will:
 3. For each WBNB pair:
    - Fetch reserves from the pair contract.
    - Quote the output via the router.
-   - Compute price impact and ensure it is ≤ 20 %.
-   - Submit `swapExactETHForTokens` swapping exactly **0.05 WBNB**.
+   - Apply a fixed 5 % slippage buffer to derive `amountOutMin`.
+   - Submit `swapExactETHForTokens` swapping exactly **0.0005 WBNB**.
 
 Console logs include block/transaction identifiers, reserves, expected output, computed slippage, and transaction hashes for successful swaps.
 
@@ -78,7 +78,7 @@ Trade constants live in `main.go`:
 | Constant | Default | Description |
 |----------|---------|-------------|
 | `tradeAmountWei` | `0.0005 WBNB` | Fixed input amount for each swap. |
-| `slippageLimitBps` | `2000` | Maximum allowed price impact in basis points (20 %). |
+| `fixedSlippageBps` | `500` | Constant slippage buffer (5 %) used to compute `amountOutMin`. |
 
 Adjust and rebuild if you need different parameters.
 

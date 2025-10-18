@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 	"crypto/ecdsa"
+	"errors"
 	"log"
-	"math"
 	"math/big"
 	"os"
 	"strings"
@@ -26,9 +26,23 @@ const (
 	PANCAKESWAP_ROUTER  = "0xD99D1c33F9fC3444f8101754aBC46c52416550D1"
 	WBNB_ADDRESS        = "0xae13d989daC2f0dEbFf460aC112a837C89BAa7cd"
 
-	tradeAmountWei   = 500000000000000 // 0.0005 WBNB in wei
-	slippageLimitBps = 2000            // max tolerated slippage (20%)
+	tradeAmountWei   = 500_000_000_000_000 // 0.0005 WBNB in wei
+	fixedSlippageBps = 500                 // 5% slippage buffer
 )
+
+func applySlippage(amount *big.Int, slippageBps int64) (*big.Int, error) {
+	if amount.Sign() <= 0 {
+		return nil, errors.New("amount must be positive")
+	}
+
+	if slippageBps < 0 || slippageBps >= 10000 {
+		return nil, errors.New("invalid slippage basis points")
+	}
+
+	scale := big.NewInt(10000 - slippageBps)
+	result := new(big.Int).Mul(amount, scale)
+	return result.Div(result, big.NewInt(10000)), nil
+}
 
 func purchaseToken(
 	ctx context.Context,
@@ -62,7 +76,9 @@ func purchaseToken(
 		return
 	}
 
-	reserves, err := pairInstance.GetReserves(nil)
+	reserveCtx, reserveCancel := context.WithTimeout(ctx, 10*time.Second)
+	reserves, err := pairInstance.GetReserves(&bind.CallOpts{Context: reserveCtx})
+	reserveCancel()
 	if err != nil {
 		log.Println("failed to fetch pair reserves:", err)
 		return
@@ -87,57 +103,27 @@ func purchaseToken(
 		return
 	}
 
-	amountsOut, err := router.GetAmountsOut(nil, amountIn, path)
+	quoteCtx, quoteCancel := context.WithTimeout(ctx, 10*time.Second)
+	amountOut, err := router.GetAmountOut(&bind.CallOpts{Context: quoteCtx}, amountIn, reserveIn, reserveOut)
+	quoteCancel()
 	if err != nil {
 		log.Println("failed to fetch quote:", err)
 		return
 	}
 
-	if len(amountsOut) < 2 {
-		log.Println("insufficient quote data (likely no liquidity), skipping")
+	expectedOut := new(big.Int).Set(amountOut)
+	amountOutMin, err := applySlippage(expectedOut, fixedSlippageBps)
+	if err != nil {
+		log.Println("failed to apply slippage:", err)
 		return
 	}
 
-	expectedOut := new(big.Int).Set(amountsOut[len(amountsOut)-1])
-	if expectedOut.Sign() == 0 {
-		log.Println("zero expected output, skipping")
-		return
-	}
-
-	reserveInPost := new(big.Int).Add(reserveIn, amountIn)
-	reserveOutPost := new(big.Int).Sub(reserveOut, expectedOut)
-	if reserveOutPost.Sign() <= 0 {
-		log.Println("resulting reserves invalid, skipping")
-		return
-	}
-
-	prePrice := new(big.Float).Quo(new(big.Float).SetInt(reserveOut), new(big.Float).SetInt(reserveIn))
-	postPrice := new(big.Float).Quo(new(big.Float).SetInt(reserveOutPost), new(big.Float).SetInt(reserveInPost))
-	if prePrice.Sign() == 0 {
-		log.Println("unable to compute price impact, skipping")
-		return
-	}
-
-	priceImpact := new(big.Float).Quo(new(big.Float).Sub(prePrice, postPrice), prePrice)
-	priceImpactFloat, _ := priceImpact.Abs(priceImpact).Float64()
-	priceImpactPercent := priceImpactFloat * 100
-	priceImpactBps := int64(math.Round(priceImpactFloat * 10000))
-
-	if priceImpactBps > slippageLimitBps {
-		log.Printf("skipping trade due to high slippage: %.2f%%", priceImpactPercent)
-		return
-	}
-
-	slippageAmount := new(big.Int).Mul(expectedOut, big.NewInt(priceImpactBps))
-	slippageAmount.Div(slippageAmount, big.NewInt(10000))
-
-	amountOutMin := new(big.Int).Sub(expectedOut, slippageAmount)
 	if amountOutMin.Sign() <= 0 {
 		log.Println("computed minimum output non-positive, skipping")
 		return
 	}
 
-	log.Printf("==> Expected out: %s (slippage: %.2f%%)", expectedOut.String(), priceImpactPercent)
+	log.Printf("==> Expected out: %s | min out (5%% slippage): %s", expectedOut.String(), amountOutMin.String())
 
 	auth, err := bind.NewKeyedTransactorWithChainID(privateKey, chainID)
 	if err != nil {
@@ -158,6 +144,7 @@ func purchaseToken(
 	}
 
 	auth.GasPrice = gasPrice
+	auth.GasLimit = 200000
 
 	deadline := big.NewInt(time.Now().Add(3 * time.Minute).Unix())
 
