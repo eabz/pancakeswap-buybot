@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"log"
+	"math"
 	"math/big"
 	"os"
 	"strings"
@@ -25,8 +26,8 @@ const (
 	PANCAKESWAP_ROUTER  = "0xD99D1c33F9fC3444f8101754aBC46c52416550D1"
 	WBNB_ADDRESS        = "0xae13d989daC2f0dEbFf460aC112a837C89BAa7cd"
 
-	tradeAmountWei = 5000000000000000 // 0.005 WBNB in wei
-	slippageBps    = 500              // 5% slippage tolerance
+	tradeAmountWei   = 500000000000000 // 0.0005 WBNB in wei
+	slippageLimitBps = 2000            // max tolerated slippage (20%)
 )
 
 func purchaseToken(
@@ -55,10 +56,38 @@ func purchaseToken(
 	path := []common.Address{wbnb, token}
 	amountIn := big.NewInt(tradeAmountWei)
 
-	callCtx, callCancel := context.WithTimeout(ctx, 10*time.Second)
-	defer callCancel()
+	pairInstance, err := generated.NewUniswapV2Pair(event.Pair, client)
+	if err != nil {
+		log.Println("failed to initialize pair instance:", err)
+		return
+	}
 
-	amountsOut, err := router.GetAmountsOut(&bind.CallOpts{Context: callCtx}, amountIn, path)
+	reserves, err := pairInstance.GetReserves(nil)
+	if err != nil {
+		log.Println("failed to fetch pair reserves:", err)
+		return
+	}
+
+	var reserveIn, reserveOut *big.Int
+	if event.Token0 == wbnb {
+		reserveIn = reserves.Reserve0
+		reserveOut = reserves.Reserve1
+	} else {
+		reserveIn = reserves.Reserve1
+		reserveOut = reserves.Reserve0
+	}
+
+	if reserveIn.Sign() == 0 || reserveOut.Sign() == 0 {
+		log.Println("pair has no liquidity, skipping")
+		return
+	}
+
+	if reserveIn.Cmp(amountIn) <= 0 {
+		log.Println("trade size exceeds available liquidity, skipping")
+		return
+	}
+
+	amountsOut, err := router.GetAmountsOut(nil, amountIn, path)
 	if err != nil {
 		log.Println("failed to fetch quote:", err)
 		return
@@ -75,34 +104,44 @@ func purchaseToken(
 		return
 	}
 
-	slippage := new(big.Int).Mul(expectedOut, big.NewInt(slippageBps))
-	slippage.Div(slippage, big.NewInt(10000))
-
-	amountOutMin := new(big.Int).Sub(expectedOut, slippage)
-	if amountOutMin.Sign() <= 0 {
-		log.Println("slippage tolerance too high, skipping")
+	reserveInPost := new(big.Int).Add(reserveIn, amountIn)
+	reserveOutPost := new(big.Int).Sub(reserveOut, expectedOut)
+	if reserveOutPost.Sign() <= 0 {
+		log.Println("resulting reserves invalid, skipping")
 		return
 	}
 
-	erc20, err := generated.NewErc20(token, client)
-	if err != nil {
-		log.Println("unable to initialize erc20 instance")
+	prePrice := new(big.Float).Quo(new(big.Float).SetInt(reserveOut), new(big.Float).SetInt(reserveIn))
+	postPrice := new(big.Float).Quo(new(big.Float).SetInt(reserveOutPost), new(big.Float).SetInt(reserveInPost))
+	if prePrice.Sign() == 0 {
+		log.Println("unable to compute price impact, skipping")
+		return
 	}
 
-	symbol, err := erc20.Symbol(nil)
-	if err != nil {
-		log.Println("unable to get erc20 symbol")
+	priceImpact := new(big.Float).Quo(new(big.Float).Sub(prePrice, postPrice), prePrice)
+	priceImpactFloat, _ := priceImpact.Abs(priceImpact).Float64()
+	priceImpactPercent := priceImpactFloat * 100
+	priceImpactBps := int64(math.Round(priceImpactFloat * 10000))
+
+	if priceImpactBps > slippageLimitBps {
+		log.Printf("skipping trade due to high slippage: %.2f%%", priceImpactPercent)
+		return
 	}
 
-	log.Println("Buying:", symbol)
-	log.Println("Amount: 0.05 WBNB")
-	log.Println("Slippage: 0.05 WBNB")
+	slippageAmount := new(big.Int).Mul(expectedOut, big.NewInt(priceImpactBps))
+	slippageAmount.Div(slippageAmount, big.NewInt(10000))
 
-	log.Printf("==> expected out: %s | min out after %.2f%% slippage: %s", expectedOut.String(), float64(slippageBps)/100, amountOutMin.String())
+	amountOutMin := new(big.Int).Sub(expectedOut, slippageAmount)
+	if amountOutMin.Sign() <= 0 {
+		log.Println("computed minimum output non-positive, skipping")
+		return
+	}
+
+	log.Printf("==> Expected out: %s (slippage: %.2f%%)", expectedOut.String(), priceImpactPercent)
 
 	auth, err := bind.NewKeyedTransactorWithChainID(privateKey, chainID)
 	if err != nil {
-		log.Println("==> failed to create transactor:", err)
+		log.Println("failed to create transactor:", err)
 		return
 	}
 
@@ -114,7 +153,7 @@ func purchaseToken(
 
 	gasPrice, err := client.SuggestGasPrice(txCtx)
 	if err != nil {
-		log.Println("==> failed to suggest gas price:", err)
+		log.Println("failed to suggest gas price:", err)
 		return
 	}
 
@@ -124,11 +163,26 @@ func purchaseToken(
 
 	tx, err := router.SwapExactETHForTokens(auth, amountOutMin, path, auth.From, deadline)
 	if err != nil {
-		log.Println("==> swap failed:", err)
+		log.Println("swap failed:", err)
 		return
 	}
 
-	log.Println("==> swap tx submitted:", tx.Hash().Hex())
+	receipt, err := bind.WaitMined(context.Background(), client, tx)
+	if err != nil {
+		log.Println("unable to get transaction receipt")
+	}
+
+	log.Println("")
+	log.Println("==> Buy transaction successful")
+	log.Println("==> Tx Hash:", tx.Hash().Hex())
+	log.Println("==> Tokens received:", amountOutMin)
+	log.Println("==> Gas used:", receipt.GasUsed)
+	if receipt.Status == 1 {
+		log.Println("==> Status: succeed")
+	} else {
+		log.Println("==> Status: failed")
+	}
+
 }
 
 func main() {
