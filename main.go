@@ -27,25 +27,13 @@ const (
 	PANCAKESWAP_ROUTER  = "0xD99D1c33F9fC3444f8101754aBC46c52416550D1"
 	WBNB_ADDRESS        = "0xae13d989daC2f0dEbFf460aC112a837C89BAa7cd"
 
-	tradeAmountWei   = 500_000_000_000_000 // 0.0005 WBNB in wei
-	fixedSlippageBps = 500                 // 5% slippage buffer
+	tradeAmountWei    = 500_000_000_000_000 // 0.0005 WBNB in wei
+	maxPriceImpactBps = 1500                // 15% maximum allowed price impact
+	minSlippageBps    = 50                  // 0.50% minimum slippage
+	safetyBufferBps   = 10                  // +0.10% buffer on top of price impact
 )
 
-func applySlippage(amount *big.Int, slippageBps int64) (*big.Int, error) {
-	if amount.Sign() <= 0 {
-		return nil, errors.New("amount must be positive")
-	}
-
-	if slippageBps < 0 || slippageBps >= 10000 {
-		return nil, errors.New("invalid slippage basis points")
-	}
-
-	scale := big.NewInt(10000 - slippageBps)
-	result := new(big.Int).Mul(amount, scale)
-	return result.Div(result, big.NewInt(10000)), nil
-}
-
-func ToDecimal(ivalue interface{}, decimals int) decimal.Decimal {
+func weiToDecimal(ivalue interface{}, decimals int) decimal.Decimal {
 	value := new(big.Int)
 	switch v := ivalue.(type) {
 	case string:
@@ -59,6 +47,45 @@ func ToDecimal(ivalue interface{}, decimals int) decimal.Decimal {
 	result := num.Div(mul)
 
 	return result.Round(6)
+}
+
+func computePriceImpactBps(amountIn, amountOut, reserveIn, reserveOut *big.Int) int64 {
+	if amountIn.Sign() <= 0 || amountOut.Sign() <= 0 || reserveIn.Sign() <= 0 || reserveOut.Sign() <= 0 {
+		return 0
+	}
+
+	midPrice := new(big.Rat).SetFrac(reserveOut, reserveIn)
+	execPrice := new(big.Rat).SetFrac(amountOut, amountIn)
+
+	ratio := new(big.Rat).Quo(execPrice, midPrice)
+	impact := new(big.Rat).Sub(new(big.Rat).SetInt64(1), ratio)
+
+	if impact.Sign() < 0 {
+		return 0
+	}
+
+	bpsRat := new(big.Rat).Mul(impact, new(big.Rat).SetInt64(10000))
+
+	bpsInt, _ := bpsRat.Float64()
+	if bpsInt < 0 {
+		return 0
+	}
+
+	return int64(bpsInt)
+}
+
+func applySlippage(amount *big.Int, slippageBps int64) (*big.Int, error) {
+	if amount.Sign() <= 0 {
+		return nil, errors.New("amount must be positive")
+	}
+
+	if slippageBps < 0 || slippageBps >= 10000 {
+		return nil, errors.New("invalid slippage basis points")
+	}
+
+	scale := big.NewInt(10000 - slippageBps)
+	result := new(big.Int).Mul(amount, scale)
+	return result.Div(result, big.NewInt(10000)), nil
 }
 
 func purchaseToken(
@@ -140,7 +167,17 @@ func purchaseToken(
 	}
 
 	expectedOut := new(big.Int).Set(amountOut)
-	amountOutMin, err := applySlippage(expectedOut, fixedSlippageBps)
+
+	piBps := computePriceImpactBps(amountIn, expectedOut, reserveIn, reserveOut)
+	log.Printf("==> Price impact: %d bps (%.2f%%)", piBps, float64(piBps)/100.0)
+	if piBps > maxPriceImpactBps {
+		log.Println("price impact exceeds limit (>", maxPriceImpactBps, "bps), skipping trade")
+		return
+	}
+
+	slippageBps := min(max(int64(piBps)+safetyBufferBps, minSlippageBps), maxPriceImpactBps)
+
+	amountOutMin, err := applySlippage(expectedOut, slippageBps)
 	if err != nil {
 		log.Println("failed to apply slippage:", err)
 		return
@@ -151,8 +188,7 @@ func purchaseToken(
 		return
 	}
 
-	log.Printf("==> Expected out: %s %s | min out (5%% slippage): %s %s", ToDecimal(expectedOut, int(decimals)), symbol, ToDecimal(amountOutMin, int(decimals)), symbol)
-
+	log.Printf("==> Expected out: %s %s | min out (slippage %d bps): %s %s", weiToDecimal(expectedOut, int(decimals)), symbol, slippageBps, weiToDecimal(amountOutMin, int(decimals)), symbol)
 	auth, err := bind.NewKeyedTransactorWithChainID(privateKey, chainID)
 	if err != nil {
 		log.Println("failed to create transactor:", err)
@@ -190,7 +226,7 @@ func purchaseToken(
 	log.Println("")
 	log.Println("==> Buy transaction successful")
 	log.Println("==> Tx Hash:", tx.Hash().Hex())
-	log.Printf("==> Tokens received: %s %s", ToDecimal(amountOutMin, int(decimals)), symbol)
+	log.Printf("==> Tokens received: %s %s", weiToDecimal(amountOutMin, int(decimals)), symbol)
 	log.Println("==> Gas used:", receipt.GasUsed)
 	if receipt.Status == 1 {
 		log.Println("==> Status: succeed")
