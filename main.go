@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"math/big"
 	"os"
 	"strings"
 
@@ -22,10 +23,11 @@ const UNISWAP_V2_ROUTER_ABI = `[{"inputs":[{"internalType":"address","name":"_fa
 
 const NEW_PAIR_EVENT = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"
 
-type NewPairEvent struct {
-	token0 common.Address
-	token1 common.Address
-	pair   common.Address
+type PairCreatedEvent struct {
+	Token0    common.Address
+	Token1    common.Address
+	Pair      common.Address
+	PairIndex *big.Int `abi:"arg3"`
 }
 
 func main() {
@@ -70,17 +72,30 @@ func main() {
 		case err := <-sub.Err():
 			log.Fatal(err)
 		case vLog := <-newPairLogChannel:
+			log.Println("")
 			log.Println("==> New pair detected...")
 
-			var event = NewPairEvent{}
+			var event PairCreatedEvent
 
-			factoryAbi.UnpackIntoInterface(&event, "PairCreated", vLog.Data)
+			if err := factoryAbi.UnpackIntoInterface(&event, "PairCreated", vLog.Data); err != nil {
+				log.Println("==> failed to unpack event:", err)
+				continue
+			}
+
+			if len(vLog.Topics) >= 3 {
+				event.Token0 = common.HexToAddress(vLog.Topics[1].Hex())
+				event.Token1 = common.HexToAddress(vLog.Topics[2].Hex())
+			}
 
 			log.Println("==> block: ", vLog.BlockNumber)
 			log.Println("==> transaction: ", vLog.TxHash.Hex())
-			log.Println("==> token0: ", event.token0)
-			log.Println("==> token1: ", event.token1)
-			log.Println("==> pair: ", event.pair)
+			log.Println("==> token0: ", event.Token0)
+			log.Println("==> token1: ", event.Token1)
+			log.Println("==> pair: ", event.Pair)
+			log.Println("==> pair index: ", event.PairIndex)
+
+			log.Println("")
+
 		}
 	}
 }
